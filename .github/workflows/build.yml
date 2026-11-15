@@ -1,0 +1,32 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 devkitPro（devkitA64 + switch-dev）
+        run: |
+          wget -q https://apt.devkitpro.org/install-devkitpro-pacman
+          chmod +x install-devkitpro-pacman
+          sudo ./install-devkitpro-pacman
+          sudo /opt/devkitpro/pacman/bin/pacman -S --noconfirm switch-dev
+
+      - name: 编译
+        run: |
+          export DEVKITPRO=/opt/devkitpro
+          export PATH=$DEVKITPRO/tools/bin:$PATH
+          make -j"$(nproc)"
+
+      - name: 上传 .nro
+        uses: actions/upload-artifact@v4
+        with:
+          name: IR-Switch-nro
+          path: "*.nro"
+          if-no-files-found: error
