@@ -2,27 +2,28 @@ name: build
 
 on:
   push:
-  pull_request:
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+      options: --user root
     steps:
+      - name: 确保 git 可用
+        run: |
+          command -v git >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends git ca-certificates)
+
       - uses: actions/checkout@v4
 
-      - name: 安装 devkitPro（devkitA64 + switch-dev）
+      - name: 显示工具链版本
         run: |
-          wget -q https://apt.devkitpro.org/install-devkitpro-pacman
-          chmod +x install-devkitpro-pacman
-          sudo ./install-devkitpro-pacman
-          sudo /opt/devkitpro/pacman/bin/pacman -S --noconfirm switch-dev
+          echo "DEVKITPRO=$DEVKITPRO"
+          aarch64-none-elf-gcc --version | head -1
 
       - name: 编译
-        run: |
-          export DEVKITPRO=/opt/devkitpro
-          export PATH=$DEVKITPRO/tools/bin:$PATH
-          make -j"$(nproc)"
+        run: make -j"$(nproc)"
 
       - name: 上传 .nro
         uses: actions/upload-artifact@v4
