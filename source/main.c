@@ -402,6 +402,49 @@ static void blitScaled(u32* fb, u32 stride_words, const u32* img, u32 iw, u32 ih
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// IRS status readout. 0x000140CD is MAKERESULT(205, 160), which libnx returns
+// when the camera's *internal* status says it is not ready: Setting,
+// FirmwareVersionRequested or FirmwareVersionIsInvalid. The shared memory the
+// service maps holds that field, so read it instead of guessing which one.
+// ---------------------------------------------------------------------------
+static const char* ir_internal_status_name(u32 st) {
+    switch (st) {
+        case 0: return "Stopped";
+        case 1: return "FirmwareUpdateNeeded";
+        case 2: return "Unknown2";
+        case 3: return "Unknown3";
+        case 4: return "Unknown4";
+        case 5: return "FirmwareVersionRequested";
+        case 6: return "FirmwareVersionIsInvalid";
+        case 7: return "Ready";
+        case 8: return "Setting";
+    }
+    return "?";
+}
+
+static void logCameraStatus(IrsIrCameraHandle irhandle) {
+    IrsIrCameraStatus cam_status = (IrsIrCameraStatus)0xFFFFFFFF;
+    Result rc = irsGetIrCameraStatus(irhandle, &cam_status);
+    if (R_FAILED(rc)) cam_status = (IrsIrCameraStatus)0xFFFFFFFF;
+
+    u32 internal = 0xFFFFFFFF, sensor_mode = 0xFFFFFFFF;
+    IrsStatusManager* mgr = (IrsStatusManager*)irsGetSharedmemAddr();
+    if (mgr && irhandle.player_number < IRS_MAX_CAMERAS) {
+        internal = mgr->device_format[irhandle.player_number].ir_camera_internal_status;
+        sensor_mode = mgr->device_format[irhandle.player_number].ir_sensor_mode;
+    }
+    logMsg("cam status %u internal %u %s mode %u rc 0x%08X",
+           (unsigned)cam_status, (unsigned)internal,
+           ir_internal_status_name(internal), (unsigned)sensor_mode, (unsigned)rc);
+
+    bool need_update = false;
+    Result urc = irsCheckFirmwareUpdateNecessity(irhandle, &need_update);
+    logMsg("firmware check rc 0x%08X update needed %d",
+           (unsigned)urc, need_update ? 1 : 0);
+}
+
 // Bytes per image for a format. The transfer memory handed to the IRS service
 // is sized from this: the original 1 MiB allocation is 50x the biggest image,
 // and every frame is copied through that buffer.
@@ -651,11 +694,16 @@ int main(int argc, char* argv[]) {
         // Every 2 s, say why nothing new arrived: the call failing is a very
         // different problem from it succeeding with an unchanged counter.
         static u64 last_poll_log = 0;
+        static bool camera_status_logged = false;
         if (R_FAILED(rc)) {
             u64 pt = svcGetSystemTick();
             if (pt - last_poll_log > (u64)(SYS_TICK_HZ * 2.0)) {
                 last_poll_log = pt;
                 logMsg("poll failed rc 0x%08X", (unsigned)rc);
+            }
+            if (!camera_status_logged) {
+                camera_status_logged = true;
+                logCameraStatus(irhandle);
             }
         } else if (state.sampling_number == sampling_number) {
             u64 pt = svcGetSystemTick();
