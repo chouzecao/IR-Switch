@@ -426,13 +426,10 @@ static Result start_ir_processor(IrsIrCameraHandle irhandle,
     config.exposure_time = presets[preset_index].exposure_ns;
     config.gain = presets[preset_index].gain;
 
-    // Transfer memory. The service maps this buffer and copies every frame
-    // through it, so it must never be smaller than the largest image it may
-    // write: keep a 320x240 floor (the 1 MiB the original code passed is 8x
-    // that and is not needed).
-    size_t need = ir_format_bytes(format);
-    if (need < 320u * 240u) need = 320u * 240u;
-    size_t tmem_size = (need + 0xFFFu) & ~(size_t)0xFFFu;
+    // Transfer memory. Back to the fixed 1 MiB the original code used: sizing
+    // it down to the image is what made the app abort on hardware, so the
+    // service clearly wants more room than the bare image.
+    const size_t tmem_size = 0x100000;
 
     last_start_rc = irsRunImageTransferProcessor(irhandle, &config, tmem_size);
     logMsg("irs start fmt %d expo %lluus gain %u led %u tmem %u -> rc 0x%08X",
@@ -515,6 +512,7 @@ int main(int argc, char* argv[]) {
     resetFrameState();
 
     while (appletMainLoop()) {
+        loop_in_window++;
         padUpdate(&pad);
         u64 kDown = padGetButtonsDown(&pad);
         if (kDown & HidNpadButton_Plus) break;
