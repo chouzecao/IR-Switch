@@ -104,7 +104,7 @@ static float loop_hz = 0.0f;
 // Automatic format sweep: cycles every resolution once, 3 s each, and logs the
 // frames that actually arrived. One run then gives the whole
 // resolution -> frame-rate curve instead of one point per manual press.
-#define SWEEP_STEP_SECONDS 3.0
+#define SWEEP_STEP_SECONDS 6.0
 static bool sweep_active = false;
 static int  sweep_saved_fmt = 3;
 static u64  sweep_step_start = 0;
@@ -426,8 +426,13 @@ static Result start_ir_processor(IrsIrCameraHandle irhandle,
     config.exposure_time = presets[preset_index].exposure_ns;
     config.gain = presets[preset_index].gain;
 
-    size_t tmem_size = (ir_format_bytes(format) + 0xFFFu) & ~(size_t)0xFFFu;
-    if (tmem_size < 0x4000) tmem_size = 0x4000;
+    // Transfer memory. The service maps this buffer and copies every frame
+    // through it, so it must never be smaller than the largest image it may
+    // write: keep a 320x240 floor (the 1 MiB the original code passed is 8x
+    // that and is not needed).
+    size_t need = ir_format_bytes(format);
+    if (need < 320u * 240u) need = 320u * 240u;
+    size_t tmem_size = (need + 0xFFFu) & ~(size_t)0xFFFu;
 
     last_start_rc = irsRunImageTransferProcessor(irhandle, &config, tmem_size);
     logMsg("irs start fmt %d expo %lluus gain %u led %u tmem %u -> rc 0x%08X",
@@ -745,7 +750,7 @@ int main(int argc, char* argv[]) {
                 drawString(framebuf, stride_words, 10, 30, msg2, RGBA8_MAXALPHA(255,255,255), 2, 2);
 
                 const char* msg3 = sweep_active
-                    ? "SWEEP: measuring every resolution, ~15s, B to cancel"
+                    ? "SWEEP: measuring every resolution, ~30s, B to cancel"
                     : "B: auto-sweep resolutions (logs fps per format)";
                 drawString(framebuf, stride_words, 10, 74, msg3,
                            RGBA8_MAXALPHA(255,255,180), 2, 2);
