@@ -23,7 +23,7 @@ A homebrew app for the switch that allows you to view the Nintendo Switch's IR c
 
 • Left/Right on D-PAD to change resolution
 
-• ZL/ZR to change the exposure preset (FAST 100us / NORMAL 300us / BRIGHT 700us)
+• ZL/ZR to change the sensor preset (FAST 100us g8 / NORMAL 300us g8 / GAIN16 300us g16)
 
 • Y to toggle software auto-gain
 

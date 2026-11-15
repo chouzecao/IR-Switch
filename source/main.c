@@ -49,13 +49,13 @@ typedef struct {
 } ExposurePreset;
 
 static const ExposurePreset presets[] = {
-    // Gain is pinned to the libnx default (8). On hardware the 16x and 4x
-    // presets left the sensor dead (black screen), so only exposure is varied.
-    // 1 ms was refused outright by the sensor (rc 0x00019CCD on a real unit),
-    // so BRIGHT stays just below that.
+    // Hardware said no to everything above 300us: 700us and 1ms both came back
+    // as rc 0x00019CCD (IRS / InvalidArgument), so 300us - the libnx default -
+    // is the ceiling. The third slot therefore varies gain instead of exposure,
+    // to find out whether 16x is also refused or was only ever a red herring.
     { "FAST",    100000ULL,  8 },
     { "NORMAL",  300000ULL,  8 },
-    { "BRIGHT",  700000ULL,  8 },
+    { "GAIN16",  300000ULL, 16 },
 };
 static const int num_presets = sizeof(presets)/sizeof(presets[0]);
 static int preset_index = 1; // NORMAL
@@ -252,6 +252,7 @@ static bool   log_file_ok = false;
 // be opened straight away. Mounting again is only a fallback: mounting a device
 // name that already exists fails, which is what silently killed the log before.
 static bool tryOpenLog(void) {
+    errno = 0;   // so a successful open does not report the earlier failure
     static const char* candidates[] = {
         "sdmc:/switch/IR-Switch.log",
         "sdmc:/IR-Switch.log"
@@ -646,6 +647,24 @@ int main(int argc, char* argv[]) {
 
         IrsImageTransferProcessorState state;
         rc = irsGetImageTransferProcessorState(irhandle, ir_buffer, ir_buffer_size, &state);
+
+        // Every 2 s, say why nothing new arrived: the call failing is a very
+        // different problem from it succeeding with an unchanged counter.
+        static u64 last_poll_log = 0;
+        if (R_FAILED(rc)) {
+            u64 pt = svcGetSystemTick();
+            if (pt - last_poll_log > (u64)(SYS_TICK_HZ * 2.0)) {
+                last_poll_log = pt;
+                logMsg("poll failed rc 0x%08X", (unsigned)rc);
+            }
+        } else if (state.sampling_number == sampling_number) {
+            u64 pt = svcGetSystemTick();
+            if (pt - last_poll_log > (u64)(SYS_TICK_HZ * 2.0)) {
+                last_poll_log = pt;
+                logMsg("no new frame, sampling_number %llu",
+                       (unsigned long long)sampling_number);
+            }
+        }
 
         if (R_SUCCEEDED(rc) && state.sampling_number != sampling_number) {
             sampling_number = state.sampling_number;
