@@ -23,11 +23,20 @@ A homebrew app for the switch that allows you to view the Nintendo Switch's IR c
 
 • Left/Right on D-PAD to change resolution
 
+• ZL/ZR to change the exposure/gain preset (FAST / NORMAL / BRIGHT)
+
+• Y to toggle software auto-gain
+
 • - to turn off IR LED
 
 Note:
 
 Higher resolution for the IR camera slows down the camera speed while lower resolution speeds up the camera speed.
+
+The IR sensor itself tops out at 320x240 - that is a hardware limit, not an app limit. The app now renders at the
+Switch's native 1280x720 with integer (pixel-perfect) scaling instead of rendering 640x480 and letting the compositor
+blur it, adds software auto-gain so dark frames stay readable, and shows a live FPS counter so the frame rate can be
+measured rather than guessed.
 
 # Usage:
 

@@ -3,10 +3,20 @@
 #include <string.h>
 #include <switch.h>
 
-#define FB_WIDTH  640
-#define FB_HEIGHT 480
+// ---------------------------------------------------------------------------
+// Display: render at the Switch's native 720p instead of 640x480.
+// The old build rendered 640x480 and let the compositor upscale it to 720p,
+// which softened both the IR image and the UI text.
+// Falls back to smaller framebuffers if the applet memory budget refuses 720p.
+// ---------------------------------------------------------------------------
+static int g_fb_w = 1280;
+static int g_fb_h = 720;
 
-// Available resolutions for cycling
+// System tick is 19.2 MHz on the Switch (used for the FPS counter).
+#define SYS_TICK_HZ 19200000.0
+
+// Available resolutions for cycling. These are the only formats the right
+// Joy-Con IR sensor + IRS service expose: 320x240 is the hardware ceiling.
 static IrsImageTransferProcessorFormat formats[] = {
     IrsImageTransferProcessorFormat_20x15,
     IrsImageTransferProcessorFormat_40x30,
@@ -21,6 +31,42 @@ static int current_format_index = 3; // start at 160x120
 static bool useThermal = false;
 static bool ledsEnabled = true;   // IR LED toggle
 static bool showUI = true;        // UI visibility toggle
+static bool autoGain = true;      // software AGC (auto brightness)
+
+// Exposure / gain presets. Exposure time is the real frame-rate lever:
+// the sensor's integration time is part of every frame's duration, so a
+// short exposure with more digital gain is faster (and noisier), while a
+// long exposure is slower and brighter. Gain is the sensor's digital gain
+// multiplier (libnx default: 300us, 8x).
+typedef struct {
+    const char* name;
+    u64 exposure_ns;
+    u32 gain;
+} ExposurePreset;
+
+static const ExposurePreset presets[] = {
+    { "FAST",    100000ULL, 16 },
+    { "NORMAL",  300000ULL,  8 },
+    { "BRIGHT", 1000000ULL,  4 },
+};
+static const int num_presets = sizeof(presets)/sizeof(presets[0]);
+static int preset_index = 1; // NORMAL
+
+// Per-frame pixel cache at native IR resolution (max 320x240) so the scaled
+// image can be re-blitted every loop without recomputing the colour mapping.
+static u32 ir_rgba[320*240];
+
+// Lookup table: intensity -> RGBA, rebuilt once per new frame.
+static u32 lut[256];
+static float agc_gain = 1.0f; // smoothed software auto-gain
+
+static u32 ir_w = 0, ir_h = 0; // current native IR dimensions
+
+// FPS counter
+static u32 frames_in_window = 0;
+static u64 fps_window_start = 0;
+static float fps_value = 0.0f;
+static u32 ambient_noise = 0;
 
 // Thermal colour mapping
 static u32 thermalColor(u8 intensity) {
@@ -34,8 +80,17 @@ static u32 thermalColor(u8 intensity) {
     } else if (t < 0.75f) {   // green → yellow
         r = (u8)((t - 0.5f) / 0.25f * 255); g = 255; b = 0;
     } else {                  // yellow → red → white
-        r = 255; g = (u8)(255 - ((t - 0.75f) / 0.25f * 255));
-        b = (u8)((t - 0.75f) / 0.25f * 255);
+        // The original ramp went yellow -> magenta (b rose while g fell),
+        // so the brightest pixels turned pink instead of white. Split the
+        // last quarter: 0.75-0.875 red-ward, 0.875-1.0 to white.
+        float u = (t - 0.75f) / 0.25f;
+        if (u < 0.5f) {
+            r = 255; g = (u8)(255.0f - u * 2.0f * 255.0f); b = 0;
+        } else {
+            r = 255;
+            g = (u8)((u - 0.5f) * 2.0f * 255.0f);
+            b = g;
+        }
     }
     return RGBA8_MAXALPHA(r, g, b);
 }
@@ -71,7 +126,9 @@ static const Glyph kFont[] = {
 
     // symbols
     {' ',{0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, {'-',{0x00,0x00,0x00,0x1F,0x00,0x00,0x00}},
-    {'/',{0x01,0x01,0x02,0x04,0x08,0x10,0x10}}
+    {'/',{0x01,0x01,0x02,0x04,0x08,0x10,0x10}}, {':',{0x00,0x04,0x04,0x00,0x04,0x04,0x00}},
+    {'.',{0x00,0x00,0x00,0x00,0x00,0x0C,0x0C}}, {'%',{0x18,0x19,0x02,0x04,0x08,0x13,0x03}},
+    {'|',{0x04,0x04,0x04,0x04,0x04,0x04,0x04}}
 };
 
 static const Glyph* findGlyph(char c) {
@@ -94,7 +151,7 @@ static void drawChar(u32* fb, u32 stride_words, int x, int y, char c, u32 color,
                     for (int dx = 0; dx < scale; dx++) {
                         int px = x + rx*scale + dx;
                         int py = y + ry*scale + dy;
-                        if (px < FB_WIDTH && py < FB_HEIGHT)
+                        if (px >= 0 && px < g_fb_w && py >= 0 && py < g_fb_h)
                             fb[py * stride_words + px] = color;
                     }
                 }
@@ -114,22 +171,105 @@ static void drawString(u32* fb, u32 stride_words, int x, int y, const char* s, u
 
 static void drawRect(u32* fb, u32 stride_words, int x, int y, int w, int h, u32 color) {
     for (int yy = 0; yy < h; yy++) {
-        int row = (y + yy) * stride_words;
+        int py = y + yy;
+        if (py < 0 || py >= g_fb_h) continue;
+        int row = py * stride_words;
         for (int xx = 0; xx < w; xx++) {
-            fb[row + x + xx] = color;
+            int px = x + xx;
+            if (px < 0 || px >= g_fb_w) continue;
+            fb[row + px] = color;
         }
     }
 }
 
-// Start image processor with current format and LED state via light_target
+// ---------------------------------------------------------------------------
+// Software auto-gain: find a robust bright reference (98th percentile) and
+// stretch the intensity range so the image uses the full palette. This is what
+// makes a 320x240, 8-bit IR frame actually readable, and it costs one pass over
+// the frame.
+// ---------------------------------------------------------------------------
+static void updateAGC(const u8* ir) {
+    if (!autoGain) { agc_gain = 1.0f; return; }
+
+    u32 hist[256];
+    memset(hist, 0, sizeof(hist));
+    const u32 count = ir_w * ir_h;
+    for (u32 i = 0; i < count; i++) hist[ir[i]]++;
+
+    u32 acc = 0, hi = 255;
+    const u32 cutoff = (u32)((float)count * 0.98f);
+    for (u32 v = 0; v < 256; v++) {
+        acc += hist[v];
+        if (acc >= cutoff) { hi = v; break; }
+    }
+    if (hi < 16) hi = 16;
+
+    float target = 235.0f / (float)hi;
+    if (target < 0.6f) target = 0.6f;
+    if (target > 6.0f) target = 6.0f;
+
+    // Smooth so the image does not pump frame to frame.
+    agc_gain = agc_gain * 0.80f + target * 0.20f;
+}
+
+static void buildLUT(void) {
+    for (int i = 0; i < 256; i++) {
+        float v = (float)i * agc_gain;
+        if (v > 255.0f) v = 255.0f;
+        u8 b = (u8)v;
+        lut[i] = useThermal ? thermalColor(b) : RGBA8_MAXALPHA(b, b, b);
+    }
+}
+
+static void convertFrame(const u8* ir) {
+    const u32 count = ir_w * ir_h;
+    updateAGC(ir);
+    buildLUT();
+    for (u32 i = 0; i < count; i++) ir_rgba[i] = lut[ir[i]];
+}
+
+// Integer-scaled, centred blit. Keeps pixels square: no blur, no distortion.
+// 240/120/60/30/15 tall formats all map to a 960x720 box at 1280x720.
+static void blitScaled(u32* fb, u32 stride_words, const u32* img, u32 iw, u32 ih, int scale, int ox) {
+    static u32 rowbuf[1280];
+    const u32 row_words = iw * (u32)scale;
+
+    for (u32 y = 0; y < ih; y++) {
+        const u32* src = img + y * iw;
+        u32* dst = rowbuf;
+        for (u32 x = 0; x < iw; x++) {
+            u32 c = src[x];
+            for (int s = 0; s < scale; s++) *dst++ = c;
+        }
+        for (int dy = 0; dy < scale; dy++) {
+            int py = (int)(y * (u32)scale) + dy;
+            if (py >= g_fb_h) break;
+            u32* target = fb + (u32)py * stride_words + (u32)ox;
+            memcpy(target, rowbuf, row_words * sizeof(u32));
+        }
+    }
+}
+
+// Start image processor with current format, LED state, exposure and gain.
 static Result start_ir_processor(IrsIrCameraHandle irhandle,
                                  IrsImageTransferProcessorFormat format) {
     IrsImageTransferProcessorConfig config;
     irsGetDefaultImageTransferProcessorConfig(&config);
-    config.format = format;
-    // 0 = all leds on, 3 = none (off)
+    config.format = (u32)format;
+    // 0 = all leds on, 1 = bright group, 2 = dim group, 3 = none (off)
     config.light_target = ledsEnabled ? 0 : 3;
+    config.exposure_time = presets[preset_index].exposure_ns;
+    config.gain = presets[preset_index].gain;
     return irsRunImageTransferProcessor(irhandle, &config, 0x100000);
+}
+
+static void resetFrameState(void) {
+    agc_gain = 1.0f;
+    frames_in_window = 0;
+    fps_window_start = svcGetSystemTick();
+    fps_value = 0.0f;
+    ambient_noise = 0;
+    memset(ir_rgba, 0, sizeof(ir_rgba));
 }
 
 int main(int argc, char* argv[]) {
@@ -139,7 +279,7 @@ int main(int argc, char* argv[]) {
 
     irsInitialize();
 
-    const size_t ir_buffer_size = 0x12c00;
+    const size_t ir_buffer_size = 0x12c00; // 320*240 bytes
     u8 *ir_buffer = (u8*)malloc(ir_buffer_size);
     if (!ir_buffer) return 0;
     memset(ir_buffer, 0, ir_buffer_size);
@@ -154,23 +294,43 @@ int main(int argc, char* argv[]) {
     rc = start_ir_processor(irhandle, formats[current_format_index]);
     if (R_FAILED(rc)) { free(ir_buffer); return 0; }
 
+    // Prefer native 720p; degrade if the applet memory budget refuses it.
     Framebuffer fb;
-    framebufferCreate(&fb, nwindowGetDefault(), FB_WIDTH, FB_HEIGHT, PIXEL_FORMAT_RGBA_8888, 2);
-    framebufferMakeLinear(&fb);
+    static const int try_w[] = { 1280, 960, 640 };
+    static const int try_h[] = {  720, 480, 480 };
+    // framebufferMakeLinear allocates a shadow buffer on top of the N buffers,
+    // so 720p double-buffered costs ~3 x 3.7 MB, not 2. If framebufferCreate
+    // refuses the size (applet memory budget), retry one step smaller.
+    // Its return type changed from void to Result across libnx versions, so the
+    // result is deliberately discarded to stay buildable on both.
+    bool fb_ok = false;
+    for (int i = 0; i < 3; i++) {
+        if (R_FAILED(framebufferCreate(&fb, nwindowGetDefault(), try_w[i], try_h[i],
+                                       PIXEL_FORMAT_RGBA_8888, 2))) {
+            continue;
+        }
+        framebufferMakeLinear(&fb);
+        g_fb_w = try_w[i];
+        g_fb_h = try_h[i];
+        fb_ok = true;
+        break;
+    }
+    if (!fb_ok) { irsStopImageProcessor(irhandle); free(ir_buffer); return 0; }
 
     u64 sampling_number = 0;
+    resetFrameState();
 
     while (appletMainLoop()) {
         padUpdate(&pad);
         u64 kDown = padGetButtonsDown(&pad);
         if (kDown & HidNpadButton_Plus) break;
 
+        bool reprocess = false;
+
         // Toggle IR LEDs (apply via light_target)
         if (kDown & HidNpadButton_Minus) {
             ledsEnabled = !ledsEnabled;
-            irsStopImageProcessor(irhandle);
-            rc = start_ir_processor(irhandle, formats[current_format_index]);
-            sampling_number = 0;
+            reprocess = true;
         }
 
         // Toggle UI visibility
@@ -181,23 +341,67 @@ int main(int argc, char* argv[]) {
         // Cycle resolutions (restart processor and keep LED state)
         if (kDown & HidNpadButton_Left) {
             if (current_format_index > 0) current_format_index--;
-            irsStopImageProcessor(irhandle);
-            rc = start_ir_processor(irhandle, formats[current_format_index]);
-            sampling_number = 0;
+            reprocess = true;
         }
         if (kDown & HidNpadButton_Right) {
             if (current_format_index < num_formats-1) current_format_index++;
-            irsStopImageProcessor(irhandle);
-            rc = start_ir_processor(irhandle, formats[current_format_index]);
-            sampling_number = 0;
+            reprocess = true;
+        }
+
+        // Exposure / gain presets: the real frame-rate control
+        if (kDown & HidNpadButton_ZL) {
+            if (preset_index > 0) preset_index--;
+            reprocess = true;
+        }
+        if (kDown & HidNpadButton_ZR) {
+            if (preset_index < num_presets-1) preset_index++;
+            reprocess = true;
+        }
+
+        // Toggle software auto-gain
+        if (kDown & HidNpadButton_Y) {
+            autoGain = !autoGain;
+            reprocess = false;
         }
 
         // Toggle thermal overlay
         if (kDown & HidNpadButton_Up) useThermal = true;
         if (kDown & HidNpadButton_Down) useThermal = false;
 
+        if (reprocess) {
+            irsStopImageProcessor(irhandle);
+            rc = start_ir_processor(irhandle, formats[current_format_index]);
+            sampling_number = 0;
+            resetFrameState();
+        }
+
         IrsImageTransferProcessorState state;
         rc = irsGetImageTransferProcessorState(irhandle, ir_buffer, ir_buffer_size, &state);
+
+        if (R_SUCCEEDED(rc) && state.sampling_number != sampling_number) {
+            sampling_number = state.sampling_number;
+            ambient_noise = state.ambient_noise_level;
+
+            switch (formats[current_format_index]) {
+                case IrsImageTransferProcessorFormat_20x15:   ir_w=20;  ir_h=15;  break;
+                case IrsImageTransferProcessorFormat_40x30:   ir_w=40;  ir_h=30;  break;
+                case IrsImageTransferProcessorFormat_80x60:   ir_w=80;  ir_h=60;  break;
+                case IrsImageTransferProcessorFormat_160x120: ir_w=160; ir_h=120; break;
+                case IrsImageTransferProcessorFormat_320x240: ir_w=320; ir_h=240; break;
+            }
+
+            convertFrame(ir_buffer);
+            frames_in_window++;
+
+            // FPS over a 500 ms window
+            u64 now = svcGetSystemTick();
+            u64 elapsed = now - fps_window_start;
+            if (elapsed >= (u64)(SYS_TICK_HZ * 0.5)) {
+                fps_value = (float)frames_in_window * (float)(SYS_TICK_HZ / (double)elapsed);
+                frames_in_window = 0;
+                fps_window_start = now;
+            }
+        }
 
         u32 stride;
         u32* framebuf = (u32*)framebufferBegin(&fb, &stride);
@@ -205,85 +409,59 @@ int main(int argc, char* argv[]) {
         if (framebuf) {
             const u32 stride_words = (stride >> 2);
 
-            if (R_SUCCEEDED(rc) && state.sampling_number != sampling_number) {
-                sampling_number = state.sampling_number;
-
-                // Determine IR resolution
-                u32 ir_width=0, ir_height=0;
-                switch (formats[current_format_index]) {
-                    case IrsImageTransferProcessorFormat_20x15:   ir_width=20; ir_height=15; break;
-                    case IrsImageTransferProcessorFormat_40x30:   ir_width=40; ir_height=30; break;
-                    case IrsImageTransferProcessorFormat_80x60:   ir_width=80; ir_height=60; break;
-                    case IrsImageTransferProcessorFormat_160x120: ir_width=160; ir_height=120; break;
-                    case IrsImageTransferProcessorFormat_320x240: ir_width=320; ir_height=240; break;
-                }
-
-                // Dynamic scaling
-                u32 scale = FB_HEIGHT / ir_height;
+            if (ir_w && ir_h) {
+                int scale = g_fb_h / (int)ir_h;
                 if (scale < 1) scale = 1;
-                u32 origin_x = (FB_WIDTH - ir_width*scale) / 2;
-                u32 origin_y = (FB_HEIGHT - ir_height*scale) / 2;
-
-                // Draw IR image
-                for (u32 y = 0; y < ir_height; y++) {
-                    for (u32 x = 0; x < ir_width; x++) {
-                        u8 intensity = ir_buffer[y * ir_width + x];
-                        u32 color = useThermal ? thermalColor(intensity)
-                                               : RGBA8_MAXALPHA(intensity,intensity,intensity);
-
-                        for (u32 dy = 0; dy < scale; dy++) {
-                            u32 py = origin_y + y*scale + dy;
-                            if (py >= FB_HEIGHT) break;
-                            for (u32 dx = 0; dx < scale; dx++) {
-                                u32 px = origin_x + x*scale + dx;
-                                if (px >= FB_WIDTH) break;
-                                framebuf[py * stride_words + px] = color;
-                            }
-                        }
-                    }
-                }
+                int view_w = (int)ir_w * scale;
+                int ox = (g_fb_w - view_w) / 2;
+                blitScaled(framebuf, stride_words, ir_rgba, ir_w, ir_h, scale, ox);
             }
 
             // UI overlay (conditionally drawn)
-if (showUI) {
-    // Top bar background (taller to fit two lines)
-    drawRect(framebuf, stride_words, 0, 0, FB_WIDTH, 56, RGBA8_MAXALPHA(0,0,0));
+            if (showUI) {
+                drawRect(framebuf, stride_words, 0, 0, g_fb_w, 56, RGBA8_MAXALPHA(0,0,0));
 
-    // First line: resolution + UI toggle
-    const char* msg1 = "Left/Right: change resolution |Left Stick: toggle UI";
-    drawString(framebuf, stride_words, 10, 8, msg1, RGBA8_MAXALPHA(255,255,255), 2, 2);
+                const char* msg1 = "L/R: resolution   ZL/ZR: exposure   Up/Down: colour";
+                drawString(framebuf, stride_words, 10, 8, msg1, RGBA8_MAXALPHA(255,255,255), 2, 2);
 
-    // Second line: colour mode + LED toggle
-    const char* msg2 = "Up/Down: colour mode     |     Minus: toggle IR LED";
-    drawString(framebuf, stride_words, 10, 26, msg2, RGBA8_MAXALPHA(255,255,255), 2, 2);
+                const char* msg2 = "Minus: IR LED   Y: auto-gain   Left Stick: hide UI";
+                drawString(framebuf, stride_words, 10, 30, msg2, RGBA8_MAXALPHA(255,255,255), 2, 2);
 
-    // Bottom-right: resolution
-    const char* res_names[] = {"20x15","40x30","80x60","160x120","320x240"};
-    char status[32];
-    snprintf(status, sizeof(status), "Resolution: %s", res_names[current_format_index]);
-    int status_width = (int)strlen(status) * (FONT_W*2 + 2);
-    int status_height = FONT_H * 2;
-    int status_x = FB_WIDTH - 10 - status_width;
-    int status_y = FB_HEIGHT - 10 - status_height;
-    drawRect(framebuf, stride_words, status_x-6, status_y-6,
-             status_width+12, status_height+12, RGBA8_MAXALPHA(0,0,0));
-    drawString(framebuf, stride_words, status_x, status_y,
-               status, RGBA8_MAXALPHA(180,255,180), 2, 2);
+                // Bottom-right: resolution + live FPS
+                const char* res_names[] = {"20x15","40x30","80x60","160x120","320x240"};
+                char status[80];
+                snprintf(status, sizeof(status), "%s  %.1f FPS", res_names[current_format_index], fps_value);
+                int status_width = (int)strlen(status) * (FONT_W*2 + 2);
+                int status_height = FONT_H * 2;
+                int status_x = g_fb_w - 10 - status_width;
+                int status_y = g_fb_h - 10 - status_height;
+                drawRect(framebuf, stride_words, status_x-6, status_y-6,
+                         status_width+12, status_height+12, RGBA8_MAXALPHA(0,0,0));
+                drawString(framebuf, stride_words, status_x, status_y,
+                           status, RGBA8_MAXALPHA(180,255,180), 2, 2);
 
-    // Bottom-left: colour mode and LED state
-    const char* mode_label = useThermal ? "Colour: Thermal" : "Colour: Grayscale";
-    char left_label[64];
-    snprintf(left_label, sizeof(left_label), "%s  | IR LED: %s",
-             mode_label, ledsEnabled ? "On" : "Off");
-    int left_width = (int)strlen(left_label) * (FONT_W*2 + 2);
-    int left_height = FONT_H * 2;
-    int left_x = 10;
-    int left_y = FB_HEIGHT - 10 - left_height;
-    drawRect(framebuf, stride_words, left_x-6, left_y-6,
-             left_width+12, left_height+12, RGBA8_MAXALPHA(0,0,0));
-    drawString(framebuf, stride_words, left_x, left_y,
-               left_label, RGBA8_MAXALPHA(200,200,255), 2, 2);
-}
+                // Bottom-left: colour mode, LED, exposure preset, gain
+                const char* mode_label = useThermal ? "Thermal" : "Grayscale";
+                char left_label[128];
+                snprintf(left_label, sizeof(left_label), "%s  | IR LED: %s  | Expo: %s  | AGC: %s %.1fx",
+                         mode_label, ledsEnabled ? "On" : "Off", presets[preset_index].name,
+                         autoGain ? "On" : "Off", (double)agc_gain);
+                int left_width = (int)strlen(left_label) * (FONT_W*2 + 2);
+                int left_height = FONT_H * 2;
+                int left_x = 10;
+                int left_y = g_fb_h - 10 - left_height;
+                drawRect(framebuf, stride_words, left_x-6, left_y-6,
+                         left_width+12, left_height+12, RGBA8_MAXALPHA(0,0,0));
+                drawString(framebuf, stride_words, left_x, left_y,
+                           left_label, RGBA8_MAXALPHA(200,200,255), 2, 2);
+
+                // Live stats in the left pillarbox
+                char stats[64];
+                snprintf(stats, sizeof(stats), "Frame: %llu", (unsigned long long)sampling_number);
+                drawString(framebuf, stride_words, 12, 300, stats, RGBA8_MAXALPHA(150,150,150), 2, 2);
+                snprintf(stats, sizeof(stats), "Noise: %u", ambient_noise);
+                drawString(framebuf, stride_words, 12, 320, stats, RGBA8_MAXALPHA(150,150,150), 2, 2);
+            }
 
             framebufferEnd(&fb);
         }
