@@ -45,12 +45,32 @@ typedef struct {
 } ExposurePreset;
 
 static const ExposurePreset presets[] = {
-    { "FAST",    100000ULL, 16 },
+    // Gain is pinned to the libnx default (8). On hardware the 16x and 4x
+    // presets left the sensor dead (black screen), so only exposure is varied:
+    // it is the parameter that actually decides how long a frame takes.
+    { "FAST",    100000ULL,  8 },
     { "NORMAL",  300000ULL,  8 },
-    { "BRIGHT", 1000000ULL,  4 },
+    { "BRIGHT", 1000000ULL,  8 },
 };
 static const int num_presets = sizeof(presets)/sizeof(presets[0]);
 static int preset_index = 1; // NORMAL
+
+// Result of the last irsRunImageTransferProcessor, plus a small transient
+// status line. When the sensor refuses an exposure/gain combination the call
+// fails and no frame ever arrives, which used to mean a permanently black
+// screen: now the failure is shown and the previous preset is restored.
+static Result last_start_rc = 0;
+static char   ir_status_msg[64] = "";
+static u64    ir_status_until = 0;
+static u64    proc_start_tick = 0;
+static bool   frame_seen_since_start = false;
+static bool   auto_recover_used = false;
+static int    preset_before = 1; // last preset the sensor accepted
+
+static void setStatus(const char* text, double seconds) {
+    snprintf(ir_status_msg, sizeof(ir_status_msg), "%s", text);
+    ir_status_until = svcGetSystemTick() + (u64)(SYS_TICK_HZ * seconds);
+}
 
 // Per-frame pixel cache at native IR resolution (max 320x240) so the scaled
 // image can be re-blitted every loop without recomputing the colour mapping.
@@ -260,7 +280,8 @@ static Result start_ir_processor(IrsIrCameraHandle irhandle,
     config.light_target = ledsEnabled ? 0 : 3;
     config.exposure_time = presets[preset_index].exposure_ns;
     config.gain = presets[preset_index].gain;
-    return irsRunImageTransferProcessor(irhandle, &config, 0x100000);
+    last_start_rc = irsRunImageTransferProcessor(irhandle, &config, 0x100000);
+    return last_start_rc;
 }
 
 static void resetFrameState(void) {
@@ -293,6 +314,7 @@ int main(int argc, char* argv[]) {
 
     rc = start_ir_processor(irhandle, formats[current_format_index]);
     if (R_FAILED(rc)) { free(ir_buffer); return 0; }
+    proc_start_tick = svcGetSystemTick();
 
     // Prefer native 720p; degrade if the applet memory budget refuses it.
     Framebuffer fb;
@@ -350,12 +372,14 @@ int main(int argc, char* argv[]) {
 
         // Exposure / gain presets: the real frame-rate control
         if (kDown & HidNpadButton_ZL) {
+            int prev = preset_index;
             if (preset_index > 0) preset_index--;
-            reprocess = true;
+            if (preset_index != prev) reprocess = true;
         }
         if (kDown & HidNpadButton_ZR) {
+            int prev = preset_index;
             if (preset_index < num_presets-1) preset_index++;
-            reprocess = true;
+            if (preset_index != prev) reprocess = true;
         }
 
         // Toggle software auto-gain
@@ -371,8 +395,23 @@ int main(int argc, char* argv[]) {
         if (reprocess) {
             irsStopImageProcessor(irhandle);
             rc = start_ir_processor(irhandle, formats[current_format_index]);
+            if (R_FAILED(rc)) {
+                // The sensor rejected this exposure/gain. Restore the last one
+                // it accepted instead of sitting on a black screen.
+                char m[64];
+                snprintf(m, sizeof(m), "EXPO REJECTED rc 0x%08X  BACK TO %s",
+                         (unsigned)rc, presets[preset_before].name);
+                setStatus(m, 5.0);
+                preset_index = preset_before;
+                irsStopImageProcessor(irhandle);
+                rc = start_ir_processor(irhandle, formats[current_format_index]);
+            } else {
+                preset_before = preset_index;
+            }
             sampling_number = 0;
             resetFrameState();
+            proc_start_tick = svcGetSystemTick();
+            frame_seen_since_start = false;
         }
 
         IrsImageTransferProcessorState state;
@@ -381,6 +420,7 @@ int main(int argc, char* argv[]) {
         if (R_SUCCEEDED(rc) && state.sampling_number != sampling_number) {
             sampling_number = state.sampling_number;
             ambient_noise = state.ambient_noise_level;
+            frame_seen_since_start = true;
 
             switch (formats[current_format_index]) {
                 case IrsImageTransferProcessorFormat_20x15:   ir_w=20;  ir_h=15;  break;
@@ -400,6 +440,26 @@ int main(int argc, char* argv[]) {
                 fps_value = (float)frames_in_window * (float)(SYS_TICK_HZ / (double)elapsed);
                 frames_in_window = 0;
                 fps_window_start = now;
+            }
+        }
+
+        // Watchdog: some configs are accepted by irsRunImageTransferProcessor but
+        // never deliver frames. Give the sensor 1.5 s, then drop back to the
+        // known-good preset (once per boot, so it cannot loop).
+        if (!frame_seen_since_start && !auto_recover_used && proc_start_tick) {
+            u64 wt = svcGetSystemTick();
+            if (wt - proc_start_tick > (u64)(SYS_TICK_HZ * 1.5)) {
+                char m[64];
+                snprintf(m, sizeof(m), "NO FRAME ON %s  REVERT TO %s",
+                         presets[preset_index].name, presets[1].name);
+                setStatus(m, 6.0);
+                auto_recover_used = true;
+                preset_index = 1;
+                irsStopImageProcessor(irhandle);
+                start_ir_processor(irhandle, formats[current_format_index]);
+                sampling_number = 0;
+                resetFrameState();
+                proc_start_tick = wt;
             }
         }
 
@@ -427,6 +487,15 @@ int main(int argc, char* argv[]) {
                 const char* msg2 = "Minus: IR LED   Y: auto-gain   Left Stick: hide UI";
                 drawString(framebuf, stride_words, 10, 30, msg2, RGBA8_MAXALPHA(255,255,255), 2, 2);
 
+                // Transient message: rejected exposure, watchdog recovery.
+                if (ir_status_msg[0] && svcGetSystemTick() < ir_status_until) {
+                    int w = (int)strlen(ir_status_msg) * (FONT_W*2 + 2);
+                    drawRect(framebuf, stride_words, 4, 56, w+12, FONT_H*2+12,
+                             RGBA8_MAXALPHA(0,0,0));
+                    drawString(framebuf, stride_words, 10, 62, ir_status_msg,
+                               RGBA8_MAXALPHA(255,170,170), 2, 2);
+                }
+
                 // Bottom-right: resolution + live FPS
                 const char* res_names[] = {"20x15","40x30","80x60","160x120","320x240"};
                 char status[80];
@@ -443,8 +512,12 @@ int main(int argc, char* argv[]) {
                 // Bottom-left: colour mode, LED, exposure preset, gain
                 const char* mode_label = useThermal ? "Thermal" : "Grayscale";
                 char left_label[128];
-                snprintf(left_label, sizeof(left_label), "%s  | IR LED: %s  | Expo: %s  | AGC: %s %.1fx",
-                         mode_label, ledsEnabled ? "On" : "Off", presets[preset_index].name,
+                snprintf(left_label, sizeof(left_label),
+                         "%s  | LED: %s  | %s %lluus G%u  | AGC: %s %.1fx",
+                         mode_label, ledsEnabled ? "On" : "Off",
+                         presets[preset_index].name,
+                         (unsigned long long)(presets[preset_index].exposure_ns / 1000),
+                         (unsigned)presets[preset_index].gain,
                          autoGain ? "On" : "Off", (double)agc_gain);
                 int left_width = (int)strlen(left_label) * (FONT_W*2 + 2);
                 int left_height = FONT_H * 2;
@@ -461,6 +534,8 @@ int main(int argc, char* argv[]) {
                 drawString(framebuf, stride_words, 12, 300, stats, RGBA8_MAXALPHA(150,150,150), 2, 2);
                 snprintf(stats, sizeof(stats), "Noise: %u", ambient_noise);
                 drawString(framebuf, stride_words, 12, 320, stats, RGBA8_MAXALPHA(150,150,150), 2, 2);
+                snprintf(stats, sizeof(stats), "Start: 0x%08X", (unsigned)last_start_rc);
+                drawString(framebuf, stride_words, 12, 340, stats, RGBA8_MAXALPHA(150,150,150), 2, 2);
             }
 
             framebufferEnd(&fb);
