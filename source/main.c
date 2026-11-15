@@ -660,6 +660,10 @@ int main(int argc, char* argv[]) {
                 case IrsImageTransferProcessorFormat_320x240: ir_w=320; ir_h=240; break;
             }
 
+            if (!last_frame_tick) {
+                logMsg("first frame, sampling_number %llu",
+                       (unsigned long long)sampling_number);
+            }
             convertFrame(ir_buffer);
             frames_in_window++;
             sweep_frames++;
@@ -715,8 +719,13 @@ int main(int argc, char* argv[]) {
                 logMsg("WATCHDOG: %s", m);
                 auto_recover_used = true;
                 preset_index = 1;
+                // Logged around each service call: if the app ever aborts in
+                // here, the last line of the log says which call did it.
+                logMsg("watchdog: stop processor");
                 irsStopImageProcessor(irhandle);
-                start_ir_processor(irhandle, formats[current_format_index]);
+                logMsg("watchdog: restart fmt %d", current_format_index);
+                last_start_rc = start_ir_processor(irhandle, formats[current_format_index]);
+                logMsg("watchdog: done, rc 0x%08X", (unsigned)last_start_rc);
                 sampling_number = 0;
                 resetFrameState();
                 proc_start_tick = wt;
