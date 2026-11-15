@@ -726,28 +726,19 @@ int main(int argc, char* argv[]) {
         }
 
         // Watchdog: some configs are accepted by irsRunImageTransferProcessor but
-        // never deliver frames. Give the sensor 1.5 s, then drop back to the
-        // known-good preset (once per boot, so it cannot loop).
+        // never deliver frames. Give the sensor 4 s, then say so once per boot and
+        // leave the session untouched - restarting it is not a fix.
         if (!frame_seen_since_start && !auto_recover_used && proc_start_tick) {
             u64 wt = svcGetSystemTick();
-            if (wt - proc_start_tick > (u64)(SYS_TICK_HZ * 1.5)) {
+            if (wt - proc_start_tick > (u64)(SYS_TICK_HZ * 4.0)) {
+                // Warn only. Tearing the processor down and starting it again
+                // is what made a wedged session worse: the stop call blocks for
+                // seconds and the restart still delivers nothing.
                 char m[64];
-                snprintf(m, sizeof(m), "NO FRAME ON %s  REVERT TO %s",
-                         presets[preset_index].name, presets[1].name);
+                snprintf(m, sizeof(m), "NO FRAME FOR %s", presets[preset_index].name);
                 setStatus(m, 6.0);
-                logMsg("WATCHDOG: %s", m);
+                logMsg("WATCHDOG: %s - leaving the processor alone", m);
                 auto_recover_used = true;
-                preset_index = 1;
-                // Logged around each service call: if the app ever aborts in
-                // here, the last line of the log says which call did it.
-                logMsg("watchdog: stop processor");
-                irsStopImageProcessor(irhandle);
-                logMsg("watchdog: restart fmt %d", current_format_index);
-                last_start_rc = start_ir_processor(irhandle, formats[current_format_index]);
-                logMsg("watchdog: done, rc 0x%08X", (unsigned)last_start_rc);
-                sampling_number = 0;
-                resetFrameState();
-                proc_start_tick = wt;
             }
         }
 
