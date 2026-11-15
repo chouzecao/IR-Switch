@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <switch.h>
+#include <stdarg.h>
 
 // ---------------------------------------------------------------------------
 // Display: render at the Switch's native 720p instead of 640x480.
@@ -63,6 +64,8 @@ static Result last_start_rc = 0;
 static char   ir_status_msg[64] = "";
 static u64    ir_status_until = 0;
 static u64    proc_start_tick = 0;
+static u64    last_frame_tick = 0;
+static bool   stalled = false;
 static bool   frame_seen_since_start = false;
 static bool   auto_recover_used = false;
 static int    preset_before = 1; // last preset the sensor accepted
@@ -203,6 +206,81 @@ static void drawRect(u32* fb, u32 stride_words, int x, int y, int w, int h, u32 
 }
 
 // ---------------------------------------------------------------------------
+// Runtime log. Every interesting event goes to two places at once:
+//   * a ring buffer drawn full-screen when X is pressed (so a failing config can
+//     be read off the console without pulling the SD card), and
+//   * sdmc:/switch/IR-Switch.log, flushed on every line so even a crash leaves
+//     the last lines behind.
+// Keeping the log in RAM first means the overlay still works if the SD card
+// mount failed.
+// ---------------------------------------------------------------------------
+#define LOG_MAX_LINES 192
+#define LOG_LINE_LEN  100
+
+static char  log_ring[LOG_MAX_LINES][LOG_LINE_LEN];
+static int   log_total = 0;              // lines ever written
+static FILE* log_file = NULL;
+static bool  log_overlay = false;
+static u64   log_tick0 = 0;
+static const char* log_path = "sdmc:/switch/IR-Switch.log";
+
+static void logMsg(const char* fmt, ...) {
+    char body[LOG_LINE_LEN];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(body, sizeof(body), fmt, ap);
+    va_end(ap);
+
+    u64 ms = (svcGetSystemTick() - log_tick0) / (u64)(SYS_TICK_HZ / 1000.0);
+    char line[LOG_LINE_LEN];
+    snprintf(line, sizeof(line), "%5llu.%03llu  %s",
+             (unsigned long long)(ms / 1000), (unsigned long long)(ms % 1000), body);
+
+    snprintf(log_ring[log_total % LOG_MAX_LINES], LOG_LINE_LEN, "%s", line);
+    log_total++;
+
+    if (log_file) {
+        fprintf(log_file, "%s\n", line);
+        fflush(log_file);   // survive a crash / power loss
+    }
+}
+
+static void logInit(void) {
+    log_tick0 = svcGetSystemTick();
+    Result rc = fsdevMountSdmc();
+    if (R_SUCCEEDED(rc)) {
+        log_file = fopen(log_path, "w");
+        if (!log_file) {
+            log_path = "sdmc:/IR-Switch.log";
+            log_file = fopen(log_path, "w");
+        }
+    }
+    logMsg("=== IR-Switch 720p + AGC build ===");
+    logMsg("sd mount rc 0x%08X, log file: %s", (unsigned)rc,
+           log_file ? log_path : "(screen only)");
+}
+
+static void drawLogOverlay(u32* fb, u32 stride_words) {
+    const int scale = 2;
+    const int line_h = FONT_H * scale + 5;
+    int max_lines = (g_fb_h - 24) / line_h;
+    if (max_lines < 1) max_lines = 1;
+
+    drawRect(fb, stride_words, 0, 0, g_fb_w, g_fb_h, RGBA8_MAXALPHA(0, 0, 0));
+
+    int first = log_total - max_lines;
+    if (first < 0) first = 0;
+    int y = 12;
+    for (int i = first; i < log_total; i++) {
+        drawString(fb, stride_words, 8, y, log_ring[i % LOG_MAX_LINES],
+                   RGBA8_MAXALPHA(130, 255, 150), scale, 1);
+        y += line_h;
+    }
+    drawString(fb, stride_words, 8, g_fb_h - 16, "X: close log",
+               RGBA8_MAXALPHA(180, 180, 180), 1, 1);
+}
+
+// ---------------------------------------------------------------------------
 // Software auto-gain: find a robust bright reference (98th percentile) and
 // stretch the intensity range so the image uses the full palette. This is what
 // makes a 320x240, 8-bit IR frame actually readable, and it costs one pass over
@@ -281,6 +359,10 @@ static Result start_ir_processor(IrsIrCameraHandle irhandle,
     config.exposure_time = presets[preset_index].exposure_ns;
     config.gain = presets[preset_index].gain;
     last_start_rc = irsRunImageTransferProcessor(irhandle, &config, 0x100000);
+    logMsg("irs start fmt %d expo %lluus gain %u led %u -> rc 0x%08X",
+           (int)format, (unsigned long long)(config.exposure_time / 1000),
+           (unsigned)config.gain, (unsigned)config.light_target,
+           (unsigned)last_start_rc);
     return last_start_rc;
 }
 
@@ -298,6 +380,8 @@ int main(int argc, char* argv[]) {
     PadState pad;
     padInitializeDefault(&pad);
 
+    logInit();
+
     irsInitialize();
 
     const size_t ir_buffer_size = 0x12c00; // 320*240 bytes
@@ -310,10 +394,15 @@ int main(int argc, char* argv[]) {
     HidNpadIdType idType = padIsHandheld(&pad) ? HidNpadIdType_Handheld : HidNpadIdType_No1;
 
     Result rc = irsGetIrCameraHandle(&irhandle, idType);
-    if (R_FAILED(rc)) { free(ir_buffer); return 0; }
+    logMsg("camera handle rc 0x%08X (handheld %d)", (unsigned)rc, padIsHandheld(&pad) != 0);
+    if (R_FAILED(rc)) { logMsg("no IR camera, aborting"); free(ir_buffer); return 0; }
 
     rc = start_ir_processor(irhandle, formats[current_format_index]);
-    if (R_FAILED(rc)) { free(ir_buffer); return 0; }
+    if (R_FAILED(rc)) {
+        logMsg("boot irs start failed 0x%08X, aborting", (unsigned)rc);
+        free(ir_buffer);
+        return 0;
+    }
     proc_start_tick = svcGetSystemTick();
 
     // Prefer native 720p; degrade if the applet memory budget refuses it.
@@ -337,7 +426,13 @@ int main(int argc, char* argv[]) {
         fb_ok = true;
         break;
     }
-    if (!fb_ok) { irsStopImageProcessor(irhandle); free(ir_buffer); return 0; }
+    logMsg("framebuffer %dx%d (ok %d)", g_fb_w, g_fb_h, fb_ok != 0);
+    if (!fb_ok) {
+        logMsg("no usable framebuffer, aborting");
+        irsStopImageProcessor(irhandle);
+        free(ir_buffer);
+        return 0;
+    }
 
     u64 sampling_number = 0;
     resetFrameState();
@@ -360,6 +455,12 @@ int main(int argc, char* argv[]) {
             showUI = !showUI;
         }
 
+        // Toggle the log overlay (X)
+        if (kDown & HidNpadButton_X) {
+            log_overlay = !log_overlay;
+            logMsg("log overlay %s", log_overlay ? "on" : "off");
+        }
+
         // Cycle resolutions (restart processor and keep LED state)
         if (kDown & HidNpadButton_Left) {
             if (current_format_index > 0) current_format_index--;
@@ -374,12 +475,22 @@ int main(int argc, char* argv[]) {
         if (kDown & HidNpadButton_ZL) {
             int prev = preset_index;
             if (preset_index > 0) preset_index--;
-            if (preset_index != prev) reprocess = true;
+            if (preset_index != prev) {
+                reprocess = true;
+                logMsg("preset -> %s (%lluus g%u)", presets[preset_index].name,
+                       (unsigned long long)(presets[preset_index].exposure_ns / 1000),
+                       (unsigned)presets[preset_index].gain);
+            }
         }
         if (kDown & HidNpadButton_ZR) {
             int prev = preset_index;
             if (preset_index < num_presets-1) preset_index++;
-            if (preset_index != prev) reprocess = true;
+            if (preset_index != prev) {
+                reprocess = true;
+                logMsg("preset -> %s (%lluus g%u)", presets[preset_index].name,
+                       (unsigned long long)(presets[preset_index].exposure_ns / 1000),
+                       (unsigned)presets[preset_index].gain);
+            }
         }
 
         // Toggle software auto-gain
@@ -393,6 +504,8 @@ int main(int argc, char* argv[]) {
         if (kDown & HidNpadButton_Down) useThermal = false;
 
         if (reprocess) {
+            logMsg("reprocess fmt %d preset %s", current_format_index,
+                   presets[preset_index].name);
             irsStopImageProcessor(irhandle);
             rc = start_ir_processor(irhandle, formats[current_format_index]);
             if (R_FAILED(rc)) {
@@ -402,6 +515,7 @@ int main(int argc, char* argv[]) {
                 snprintf(m, sizeof(m), "EXPO REJECTED rc 0x%08X  BACK TO %s",
                          (unsigned)rc, presets[preset_before].name);
                 setStatus(m, 5.0);
+                logMsg("EXPO REJECTED: %s", m);
                 preset_index = preset_before;
                 irsStopImageProcessor(irhandle);
                 rc = start_ir_processor(irhandle, formats[current_format_index]);
@@ -434,12 +548,37 @@ int main(int argc, char* argv[]) {
             frames_in_window++;
 
             // FPS over a 500 ms window
+            static int fps_log_div = 0;
+            last_frame_tick = svcGetSystemTick();
+            if (stalled) {
+                stalled = false;
+                logMsg("frames resumed");
+            }
             u64 now = svcGetSystemTick();
             u64 elapsed = now - fps_window_start;
             if (elapsed >= (u64)(SYS_TICK_HZ * 0.5)) {
                 fps_value = (float)frames_in_window * (float)(SYS_TICK_HZ / (double)elapsed);
                 frames_in_window = 0;
                 fps_window_start = now;
+                // one line per second: the framerate history ends up in the file
+                if (++fps_log_div >= 2) {
+                    fps_log_div = 0;
+                    logMsg("fps %.1f  frame %llu  fmt %d  expo %s  agc %.2f  noise %u",
+                           (double)fps_value, (unsigned long long)sampling_number,
+                           current_format_index, presets[preset_index].name,
+                           (double)agc_gain, ambient_noise);
+                }
+            }
+        }
+
+        // Stall detection: the processor is running but no frame is arriving.
+        if (!stalled && last_frame_tick) {
+            u64 st = svcGetSystemTick();
+            if (st - last_frame_tick > (u64)(SYS_TICK_HZ * 0.7)) {
+                stalled = true;
+                logMsg("no frames for %llums (fmt %d, expo %s)",
+                       (unsigned long long)((st - last_frame_tick) / (u64)(SYS_TICK_HZ / 1000.0)),
+                       current_format_index, presets[preset_index].name);
             }
         }
 
@@ -453,6 +592,7 @@ int main(int argc, char* argv[]) {
                 snprintf(m, sizeof(m), "NO FRAME ON %s  REVERT TO %s",
                          presets[preset_index].name, presets[1].name);
                 setStatus(m, 6.0);
+                logMsg("WATCHDOG: %s", m);
                 auto_recover_used = true;
                 preset_index = 1;
                 irsStopImageProcessor(irhandle);
@@ -484,7 +624,7 @@ int main(int argc, char* argv[]) {
                 const char* msg1 = "L/R: resolution   ZL/ZR: exposure   Up/Down: colour";
                 drawString(framebuf, stride_words, 10, 8, msg1, RGBA8_MAXALPHA(255,255,255), 2, 2);
 
-                const char* msg2 = "Minus: IR LED   Y: auto-gain   Left Stick: hide UI";
+                const char* msg2 = "Minus: IR LED   Y: auto-gain   X: log   LStick: hide UI";
                 drawString(framebuf, stride_words, 10, 30, msg2, RGBA8_MAXALPHA(255,255,255), 2, 2);
 
                 // Transient message: rejected exposure, watchdog recovery.
@@ -538,9 +678,14 @@ int main(int argc, char* argv[]) {
                 drawString(framebuf, stride_words, 12, 340, stats, RGBA8_MAXALPHA(150,150,150), 2, 2);
             }
 
+            if (log_overlay) drawLogOverlay(framebuf, stride_words);
+
             framebufferEnd(&fb);
         }
     }
+
+    logMsg("=== exit ===");
+    if (log_file) { fclose(log_file); log_file = NULL; }
 
     framebufferClose(&fb);
     irsStopImageProcessor(irhandle);
