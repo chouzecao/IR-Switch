@@ -50,11 +50,12 @@ typedef struct {
 
 static const ExposurePreset presets[] = {
     // Gain is pinned to the libnx default (8). On hardware the 16x and 4x
-    // presets left the sensor dead (black screen), so only exposure is varied:
-    // it is the parameter that actually decides how long a frame takes.
+    // presets left the sensor dead (black screen), so only exposure is varied.
+    // 1 ms was refused outright by the sensor (rc 0x00019CCD on a real unit),
+    // so BRIGHT stays just below that.
     { "FAST",    100000ULL,  8 },
     { "NORMAL",  300000ULL,  8 },
-    { "BRIGHT", 1000000ULL,  8 },
+    { "BRIGHT",  700000ULL,  8 },
 };
 static const int num_presets = sizeof(presets)/sizeof(presets[0]);
 static int preset_index = 1; // NORMAL
@@ -93,6 +94,24 @@ static u32 frames_in_window = 0;
 static u64 fps_window_start = 0;
 static float fps_value = 0.0f;
 static u32 ambient_noise = 0;
+
+// Render-loop rate, measured separately from the IR frame rate. The two are
+// very different: the camera can hand over ~1 image per second while the loop
+// still runs at 60 Hz, and only measuring both tells them apart.
+static u32 loop_in_window = 0;
+static float loop_hz = 0.0f;
+
+// Automatic format sweep: cycles every resolution once, 3 s each, and logs the
+// frames that actually arrived. One run then gives the whole
+// resolution -> frame-rate curve instead of one point per manual press.
+#define SWEEP_STEP_SECONDS 3.0
+static bool sweep_active = false;
+static int  sweep_saved_fmt = 3;
+static u64  sweep_step_start = 0;
+static u32  sweep_frames = 0;
+
+// Resolution names, indexed like formats[].
+static const char* ir_format_names[] = { "20x15", "40x30", "80x60", "160x120", "320x240" };
 
 // Thermal colour mapping
 static u32 thermalColor(u8 intensity) {
@@ -382,6 +401,20 @@ static void blitScaled(u32* fb, u32 stride_words, const u32* img, u32 iw, u32 ih
     }
 }
 
+// Bytes per image for a format. The transfer memory handed to the IRS service
+// is sized from this: the original 1 MiB allocation is 50x the biggest image,
+// and every frame is copied through that buffer.
+static size_t ir_format_bytes(IrsImageTransferProcessorFormat format) {
+    switch (format) {
+        case IrsImageTransferProcessorFormat_320x240: return 320u * 240u;
+        case IrsImageTransferProcessorFormat_160x120: return 160u * 120u;
+        case IrsImageTransferProcessorFormat_80x60:   return 80u * 60u;
+        case IrsImageTransferProcessorFormat_40x30:   return 40u * 30u;
+        case IrsImageTransferProcessorFormat_20x15:   return 20u * 15u;
+    }
+    return 320u * 240u;
+}
+
 // Start image processor with current format, LED state, exposure and gain.
 static Result start_ir_processor(IrsIrCameraHandle irhandle,
                                  IrsImageTransferProcessorFormat format) {
@@ -392,17 +425,22 @@ static Result start_ir_processor(IrsIrCameraHandle irhandle,
     config.light_target = ledsEnabled ? 0 : 3;
     config.exposure_time = presets[preset_index].exposure_ns;
     config.gain = presets[preset_index].gain;
-    last_start_rc = irsRunImageTransferProcessor(irhandle, &config, 0x100000);
-    logMsg("irs start fmt %d expo %lluus gain %u led %u -> rc 0x%08X",
+
+    size_t tmem_size = (ir_format_bytes(format) + 0xFFFu) & ~(size_t)0xFFFu;
+    if (tmem_size < 0x4000) tmem_size = 0x4000;
+
+    last_start_rc = irsRunImageTransferProcessor(irhandle, &config, tmem_size);
+    logMsg("irs start fmt %d expo %lluus gain %u led %u tmem %u -> rc 0x%08X",
            (int)format, (unsigned long long)(config.exposure_time / 1000),
            (unsigned)config.gain, (unsigned)config.light_target,
-           (unsigned)last_start_rc);
+           (unsigned)tmem_size, (unsigned)last_start_rc);
     return last_start_rc;
 }
 
 static void resetFrameState(void) {
     agc_gain = 1.0f;
     frames_in_window = 0;
+    loop_in_window = 0;
     fps_window_start = svcGetSystemTick();
     fps_value = 0.0f;
     ambient_noise = 0;
@@ -530,7 +568,23 @@ int main(int argc, char* argv[]) {
         // Toggle software auto-gain
         if (kDown & HidNpadButton_Y) {
             autoGain = !autoGain;
-            reprocess = false;
+        }
+
+        // Automatic resolution sweep (B): 3 s per format, logged. Cancels if
+        // pressed again; the format in use before the sweep is restored.
+        if (kDown & HidNpadButton_B) {
+            if (sweep_active) {
+                logMsg("sweep cancelled at fmt %d", current_format_index);
+                sweep_active = false;
+                current_format_index = sweep_saved_fmt;
+                reprocess = true;
+            } else {
+                sweep_active = true;
+                sweep_saved_fmt = current_format_index;
+                current_format_index = 0;
+                reprocess = true;
+                logMsg("sweep start (B cancels)");
+            }
         }
 
         // Toggle thermal overlay
@@ -560,6 +614,31 @@ int main(int argc, char* argv[]) {
             resetFrameState();
             proc_start_tick = svcGetSystemTick();
             frame_seen_since_start = false;
+            // Give each sweep step a fresh measurement window.
+            sweep_step_start = proc_start_tick;
+            sweep_frames = 0;
+        }
+
+        // Automatic sweep step: each format gets SWEEP_STEP_SECONDS to deliver
+        // frames, then the next one starts. The logged bytes/frames/fps rows are
+        // the resolution -> frame-rate curve, measured on real hardware.
+        if (sweep_active && !reprocess) {
+            u64 st = svcGetSystemTick();
+            if (st - sweep_step_start >= (u64)(SYS_TICK_HZ * SWEEP_STEP_SECONDS)) {
+                double secs = (double)(st - sweep_step_start) / (double)SYS_TICK_HZ;
+                size_t bytes = ir_format_bytes(formats[current_format_index]);
+                logMsg("sweep fmt %d %s bytes %u frames %u fps %.2f",
+                       current_format_index, ir_format_names[current_format_index],
+                       (unsigned)bytes, sweep_frames,
+                       secs > 0.0 ? (double)sweep_frames / secs : 0.0);
+                if (current_format_index < num_formats - 1) {
+                    current_format_index++;
+                } else {
+                    sweep_active = false;
+                    current_format_index = sweep_saved_fmt;
+                }
+                reprocess = true;
+            }
         }
 
         IrsImageTransferProcessorState state;
@@ -580,6 +659,7 @@ int main(int argc, char* argv[]) {
 
             convertFrame(ir_buffer);
             frames_in_window++;
+            sweep_frames++;
 
             // FPS over a 500 ms window
             static int fps_log_div = 0;
@@ -592,13 +672,16 @@ int main(int argc, char* argv[]) {
             u64 elapsed = now - fps_window_start;
             if (elapsed >= (u64)(SYS_TICK_HZ * 0.5)) {
                 fps_value = (float)frames_in_window * (float)(SYS_TICK_HZ / (double)elapsed);
+                loop_hz = (float)loop_in_window * (float)(SYS_TICK_HZ / (double)elapsed);
                 frames_in_window = 0;
+                loop_in_window = 0;
                 fps_window_start = now;
                 // one line per second: the framerate history ends up in the file
                 if (++fps_log_div >= 2) {
                     fps_log_div = 0;
-                    logMsg("fps %.1f  frame %llu  fmt %d  expo %s  agc %.2f  noise %u",
-                           (double)fps_value, (unsigned long long)sampling_number,
+                    logMsg("fps %.1f  loop %.0fHz  frame %llu  fmt %d  expo %s  agc %.2f  noise %u",
+                           (double)fps_value, (double)loop_hz,
+                           (unsigned long long)sampling_number,
                            current_format_index, presets[preset_index].name,
                            (double)agc_gain, ambient_noise);
                 }
@@ -661,6 +744,12 @@ int main(int argc, char* argv[]) {
                 const char* msg2 = "Minus: IR LED   Y: auto-gain   X: log   LStick: hide UI";
                 drawString(framebuf, stride_words, 10, 30, msg2, RGBA8_MAXALPHA(255,255,255), 2, 2);
 
+                const char* msg3 = sweep_active
+                    ? "SWEEP: measuring every resolution, ~15s, B to cancel"
+                    : "B: auto-sweep resolutions (logs fps per format)";
+                drawString(framebuf, stride_words, 10, 74, msg3,
+                           RGBA8_MAXALPHA(255,255,180), 2, 2);
+
                 // Transient message: rejected exposure, watchdog recovery.
                 if (ir_status_msg[0] && svcGetSystemTick() < ir_status_until) {
                     int w = (int)strlen(ir_status_msg) * (FONT_W*2 + 2);
@@ -671,9 +760,9 @@ int main(int argc, char* argv[]) {
                 }
 
                 // Bottom-right: resolution + live FPS
-                const char* res_names[] = {"20x15","40x30","80x60","160x120","320x240"};
                 char status[80];
-                snprintf(status, sizeof(status), "%s  %.1f FPS", res_names[current_format_index], fps_value);
+                snprintf(status, sizeof(status), "%s  %.1f FPS",
+                         ir_format_names[current_format_index], fps_value);
                 int status_width = (int)strlen(status) * (FONT_W*2 + 2);
                 int status_height = FONT_H * 2;
                 int status_x = g_fb_w - 10 - status_width;

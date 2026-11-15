@@ -23,9 +23,13 @@ A homebrew app for the switch that allows you to view the Nintendo Switch's IR c
 
 • Left/Right on D-PAD to change resolution
 
-• ZL/ZR to change the exposure/gain preset (FAST / NORMAL / BRIGHT)
+• ZL/ZR to change the exposure preset (FAST 100us / NORMAL 300us / BRIGHT 700us)
 
 • Y to toggle software auto-gain
+
+• B to run an automatic resolution sweep (3 s per step, all five formats)
+
+• X to toggle the on-screen log, which is also written to sdmc:/switch/IR-Switch.log
 
 • - to turn off IR LED
 
@@ -37,6 +41,12 @@ The IR sensor itself tops out at 320x240 - that is a hardware limit, not an app 
 Switch's native 1280x720 with integer (pixel-perfect) scaling instead of rendering 640x480 and letting the compositor
 blur it, adds software auto-gain so dark frames stay readable, and shows a live FPS counter so the frame rate can be
 measured rather than guessed.
+
+Measured on hardware: at 160x120 the sensor delivers roughly one image per second, i.e. about 17 KB/s of image
+data, and the render loop is not the bottleneck (it runs at ~60 Hz while frames arrive once a second). Because that
+budget is a byte rate, the frames per second roughly scale with 1 / (width * height): a smaller format is faster,
+a larger one proportionally slower. Press B and read the `sweep fmt ... frames ... fps ...` lines in the log to get
+the exact curve on your unit.
 
 # Usage:
 
