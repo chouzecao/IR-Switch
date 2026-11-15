@@ -3,6 +3,9 @@
 #include <string.h>
 #include <switch.h>
 #include <stdarg.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 // ---------------------------------------------------------------------------
 // Display: render at the Switch's native 720p instead of 640x480.
@@ -223,6 +226,26 @@ static FILE* log_file = NULL;
 static bool  log_overlay = false;
 static u64   log_tick0 = 0;
 static const char* log_path = "sdmc:/switch/IR-Switch.log";
+static Result log_mount_rc = 0;
+static bool   log_file_ok = false;
+
+// libnx mounts "sdmc:" in __appInit before main() runs, so the file can usually
+// be opened straight away. Mounting again is only a fallback: mounting a device
+// name that already exists fails, which is what silently killed the log before.
+static bool tryOpenLog(void) {
+    static const char* candidates[] = {
+        "sdmc:/switch/IR-Switch.log",
+        "sdmc:/IR-Switch.log"
+    };
+    for (int i = 0; i < 2; i++) {
+        log_file = fopen(candidates[i], "w");
+        if (log_file) {
+            log_path = candidates[i];
+            return true;
+        }
+    }
+    return false;
+}
 
 static void logMsg(const char* fmt, ...) {
     // Shorter than LOG_LINE_LEN so the timestamp prefix always fits: gcc's
@@ -249,17 +272,26 @@ static void logMsg(const char* fmt, ...) {
 
 static void logInit(void) {
     log_tick0 = svcGetSystemTick();
-    Result rc = fsdevMountSdmc();
-    if (R_SUCCEEDED(rc)) {
-        log_file = fopen(log_path, "w");
-        if (!log_file) {
-            log_path = "sdmc:/IR-Switch.log";
-            log_file = fopen(log_path, "w");
-        }
+
+    log_file_ok = tryOpenLog();
+    if (!log_file_ok) {
+        // sdmc missing or unwritable: make sure the directory exists, then retry.
+        mkdir("sdmc:/switch", 0777);
+        log_file_ok = tryOpenLog();
     }
+    if (!log_file_ok) {
+        log_mount_rc = fsdevMountSdmc();
+        log_file_ok = tryOpenLog();
+    }
+
     logMsg("=== IR-Switch 720p + AGC build ===");
-    logMsg("sd mount rc 0x%08X, log file: %s", (unsigned)rc,
-           log_file ? log_path : "(screen only)");
+    logMsg("log file %s (%s) mount rc 0x%08X errno %d",
+           log_path, log_file_ok ? "ok" : "FAILED",
+           (unsigned)log_mount_rc, errno);
+
+    char cwd[64] = {0};
+    if (getcwd(cwd, sizeof(cwd))) logMsg("cwd %s", cwd);
+    if (!log_file_ok) setStatus("LOG FILE FAILED - PRESS X", 8.0);
 }
 
 static void drawLogOverlay(u32* fb, u32 stride_words) {
