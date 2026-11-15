@@ -225,7 +225,9 @@ static u64   log_tick0 = 0;
 static const char* log_path = "sdmc:/switch/IR-Switch.log";
 
 static void logMsg(const char* fmt, ...) {
-    char body[LOG_LINE_LEN];
+    // Shorter than LOG_LINE_LEN so the timestamp prefix always fits: gcc's
+    // -Wformat-truncation checks the worst case, not the actual string.
+    char body[LOG_LINE_LEN - 24];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(body, sizeof(body), fmt, ap);
